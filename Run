@@ -1,0 +1,926 @@
+
+#!/bin/bash
+
+# ============================ KONFIGURASI WARNA ============================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+NC='\033[0m' # No Color
+
+# ============================ KONFIGURASI VARIABEL ============================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$SCRIPT_DIR/xmrig-miner"
+CONFIG_DIR="$SCRIPT_DIR/config"
+LOG_DIR="$SCRIPT_DIR/logs"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+WALLET_FILE="$CONFIG_DIR/wallet.txt"
+AUTO_WITHDRAWAL_FILE="$CONFIG_DIR/auto_withdrawal.txt"
+
+# Buat direktori yang diperlukan
+mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+
+# ============================ DETEKSI SISTEM ============================
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)     OS="linux";;
+        Darwin*)    OS="mac";;
+        CYGWIN*|MINGW*|MSYS*) OS="windows";;
+        *)          OS="unknown";;
+    esac
+    echo "$OS"
+}
+
+detect_architecture() {
+    case "$(uname -m)" in
+        x86_64*)    ARCH="x64";;
+        i386|i686*) ARCH="x86";;
+        armv7l*)    ARCH="arm";;
+        aarch64*)   ARCH="arm64";;
+        *)          ARCH="unknown";;
+    esac
+    echo "$ARCH"
+}
+
+OS=$(detect_os)
+ARCH=$(detect_architecture)
+
+# ============================ DETEKSI HARDWARE ============================
+detect_cpu() {
+    echo -e "${CYAN}Detecting CPU...${NC}"
+    if [[ "$OS" == "linux" ]]; then
+        CPU_MODEL=$(grep -m 1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+        CPU_CORES=$(nproc)
+        echo -e "${GREEN}CPU: $CPU_MODEL${NC}"
+        echo -e "${GREEN}Cores: $CPU_CORES${NC}"
+    elif [[ "$OS" == "mac" ]]; then
+        CPU_MODEL=$(sysctl -n machdep.cpu.brand_string)
+        CPU_CORES=$(sysctl -n hw.ncpu)
+        echo -e "${GREEN}CPU: $CPU_MODEL${NC}"
+        echo -e "${GREEN}Cores: $CPU_CORES${NC}"
+    elif [[ "$OS" == "windows" ]]; then
+        CPU_MODEL=$(wmic cpu get name | sed -n 2p)
+        CPU_CORES=$(wmic cpu get NumberOfCores | sed -n 2p)
+        echo -e "${GREEN}CPU: $CPU_MODEL${NC}"
+        echo -e "${GREEN}Cores: $CPU_CORES${NC}"
+    fi
+}
+
+detect_nvidia_gpu() {
+    echo -e "${CYAN}Detecting NVIDIA GPUs...${NC}"
+    if command -v nvidia-smi &> /dev/null; then
+        NVIDIA_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | head -1)
+        if [[ ! -z "$NVIDIA_COUNT" ]] && [[ "$NVIDIA_COUNT" =~ ^[0-9]+$ ]]; then
+            echo -e "${GREEN}NVIDIA GPUs detected: $NVIDIA_COUNT${NC}"
+            nvidia-smi --query-gpu=name,memory.total --format=csv
+            return 0
+        fi
+    fi
+    echo -e "${YELLOW}No NVIDIA GPUs detected${NC}"
+    return 1
+}
+
+detect_amd_gpu() {
+    echo -e "${CYAN}Detecting AMD GPUs...${NC}"
+    if command -v rocm-smi &> /dev/null; then
+        echo -e "${GREEN}AMD ROCm detected${NC}"
+        rocm-smi
+        return 0
+    elif [[ "$OS" == "linux" ]] && lspci | grep -i "amd\|ati" | grep -i "vga\|display" &> /dev/null; then
+        echo -e "${GREEN}AMD GPUs detected (driver check needed)${NC}"
+        lspci | grep -i "amd\|ati" | grep -i "vga\|display"
+        return 0
+    fi
+    echo -e "${YELLOW}No AMD GPUs detected${NC}"
+    return 1
+}
+
+detect_intel_gpu() {
+    echo -e "${CYAN}Detecting Intel GPUs...${NC}"
+    if [[ "$OS" == "linux" ]] && lspci | grep -i "intel" | grep -i "vga\|display" &> /dev/null; then
+        echo -e "${GREEN}Intel GPUs detected${NC}"
+        lspci | grep -i "intel" | grep -i "vga\|display"
+        return 0
+    elif [[ "$OS" == "windows" ]]; then
+        echo -e "${GREEN}Checking Intel GPUs on Windows...${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}No Intel GPUs detected${NC}"
+    return 1
+}
+
+detect_hardware() {
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}                 HARDWARE DETECTION                      ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    # Deteksi CPU
+    detect_cpu
+    
+    # Deteksi GPU
+    echo -e "${CYAN}---------------------------------------------------------${NC}"
+    echo -e "${CYAN}                  GPU DETECTION                          ${NC}"
+    echo -e "${CYAN}---------------------------------------------------------${NC}"
+    
+    detect_nvidia_gpu
+    detect_amd_gpu
+    detect_intel_gpu
+    
+    echo -e "${CYAN}=========================================================${NC}"
+}
+
+# ============================ INPUT WALLET ADDRESS ============================
+input_wallet_address() {
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}                WALLET ADDRESS SETUP                     ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    if [[ -f "$WALLET_FILE" ]]; then
+        CURRENT_WALLET=$(cat "$WALLET_FILE")
+        echo -e "${GREEN}Current wallet: $CURRENT_WALLET${NC}"
+        read -p "Do you want to change wallet address? (y/n): " CHANGE_WALLET
+        if [[ "$CHANGE_WALLET" != "y" ]]; then
+            return
+        fi
+    fi
+    
+    echo -e "\n${YELLOW}Supported Cryptocurrencies:${NC}"
+    echo -e "1. Ravencoin (RVN)"
+    echo -e "2. Zephyr (ZEPH)"
+    echo -e "3. Monero (XMR)"
+    echo -e "4. Ethereum Classic (ETC)"
+    echo -e "5. Conflux (CFX)"
+    echo -e "6. Ergo (ERG)"
+    echo -e "7. Bitcoin (BTC)"
+    echo -e "8. Ethereum (ETH)"
+    echo -e "9. Other (Custom)"
+    
+    read -p "Select cryptocurrency (1-9): " COIN_CHOICE
+    
+    case $COIN_CHOICE in
+        1) 
+            COIN="RVN"
+            POOL="rvn-eu1.nanopool.org"
+            PORT="10400"
+            ALGO="kawpow"
+            ;;
+        2) 
+            COIN="ZEPH"
+            POOL="zeph-eu1.nanopool.org"
+            PORT="10900"
+            ALGO="randomx"
+            ;;
+        3) 
+            COIN="XMR"
+            POOL="xmr-eu1.nanopool.org"
+            PORT="10300"
+            ALGO="randomx"
+            ;;
+        4) 
+            COIN="ETC"
+            POOL="etc-eu1.nanopool.org"
+            PORT="10100"
+            ALGO="etchash"
+            ;;
+        5) 
+            COIN="CFX"
+            POOL="ergo-eu1.nanopool.org"
+            PORT="10500"
+            ALGO="octopus"
+            ;;
+        6) 
+            COIN="ERG"
+            POOL="ergo-eu1.nanopool.org"
+            PORT="10600"
+            ALGO="autolykos2"
+            ;;
+        7) 
+            COIN="BTC"
+            POOL="btc.nanopool.org"
+            PORT="3333"
+            ALGO="sha256"
+            ;;
+        8) 
+            COIN="ETH"
+            POOL="eth.nanopool.org"
+            PORT="9999"
+            ALGO="ethash"
+            ;;
+        9) 
+            read -p "Enter coin symbol: " COIN
+            read -p "Enter pool address: " POOL
+            read -p "Enter port: " PORT
+            read -p "Enter algorithm: " ALGO
+            ;;
+        *) 
+            echo -e "${RED}Invalid choice, using Monero as default${NC}"
+            COIN="XMR"
+            POOL="xmr.nanopool.org"
+            PORT="10300"
+            ALGO="randomx"
+            ;;
+    esac
+    
+    echo -e "\n${YELLOW}Enter your wallet address for $COIN:${NC}"
+    read -p "Wallet: " WALLET_ADDRESS
+    
+    if [[ -z "$WALLET_ADDRESS" ]]; then
+        echo -e "${RED}Wallet address cannot be empty!${NC}"
+        return 1
+    fi
+    
+    # Validasi dasar wallet address
+    if [[ ${#WALLET_ADDRESS} -lt 20 ]]; then
+        echo -e "${YELLOW}Warning: Wallet address seems too short${NC}"
+    fi
+    
+    echo "$WALLET_ADDRESS" > "$WALLET_FILE"
+    echo "$COIN" > "$CONFIG_DIR/coin.txt"
+    echo "$POOL" > "$CONFIG_DIR/pool.txt"
+    echo "$PORT" > "$CONFIG_DIR/port.txt"
+    echo "$ALGO" > "$CONFIG_DIR/algo.txt"
+    
+    echo -e "${GREEN}Wallet address saved successfully!${NC}"
+    echo -e "${GREEN}Coin: $COIN${NC}"
+    echo -e "${GREEN}Pool: $POOL${NC}"
+    echo -e "${GREEN}Port: $PORT${NC}"
+    echo -e "${GREEN}Algorithm: $ALGO${NC}"
+    
+    return 0
+}
+
+# ============================ DASHBOARD INFORMATION ============================
+fetch_mining_data() {
+    if [[ ! -f "$WALLET_FILE" ]]; then
+        echo -e "${RED}No wallet address configured!${NC}"
+        return 1
+    fi
+    
+    WALLET=$(cat "$WALLET_FILE")
+    COIN=$(cat "$CONFIG_DIR/coin.txt" 2>/dev/null || echo "ETH")
+    
+    # API endpoints untuk berbagai coin
+    case $COIN in
+        "ETH") 
+            API_URL="https://api.nanopool.org/v1/eth/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/eth/workers/$WALLET"
+            ;;
+        "BTC")
+            API_URL="https://api.nanopool.org/v1/btc/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/btc/workers/$WALLET"
+            ;;
+        "XMR")
+            API_URL="https://api.nanopool.org/v1/xmr/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/xmr/workers/$WALLET"
+            ;;
+        "LTC")
+            API_URL="https://api.nanopool.org/v1/ltc/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/ltc/workers/$WALLET"
+            ;;
+        "SOL")
+            API_URL="https://api.nanopool.org/v1/sol/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/sol/workers/$WALLET"
+            ;;
+        *)
+            API_URL="https://api.nanopool.org/v1/eth/user/$WALLET"
+            WORKER_URL="https://api.nanopool.org/v1/eth/workers/$WALLET"
+            ;;
+    esac
+    
+    # Fetch data dari Nanopool API
+    USER_DATA=$(curl -s "$API_URL")
+    WORKER_DATA=$(curl -s "$WORKER_URL")
+    
+    if [[ -z "$USER_DATA" ]] || [[ "$USER_DATA" == *"error"* ]]; then
+        echo -e "${RED}Error fetching data from Nanopool API${NC}"
+        return 1
+    fi
+    
+    # Parse data JSON
+    BALANCE=$(echo "$USER_DATA" | grep -o '"balance":[0-9.]*' | cut -d: -f2)
+    HASH_RATE=$(echo "$USER_DATA" | grep -o '"hashrate":[0-9.]*' | cut -d: -f2)
+    WORKERS_COUNT=$(echo "$USER_DATA" | grep -o '"workers":[0-9]*' | cut -d: -f2)
+    
+    # Update balance setiap 60 detik
+    if [[ ! -f "$CONFIG_DIR/last_update.txt" ]] || \
+       [[ $(($(date +%s) - $(cat "$CONFIG_DIR/last_update.txt"))) -ge 60 ]]; then
+        date +%s > "$CONFIG_DIR/last_update.txt"
+    fi
+    
+    return 0
+}
+
+display_dashboard() {
+    clear
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}               MINING DASHBOARD - NANOPOOL               ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    if fetch_mining_data; then
+        echo -e "${GREEN}Wallet: ${WALLET:0:12}...${WALLET: -8}${NC}"
+        echo -e "${GREEN}Coin: $COIN${NC}"
+        echo -e "${CYAN}---------------------------------------------------------${NC}"
+        echo -e "${YELLOW}Balance: $BALANCE $COIN${NC}"
+        echo -e "${YELLOW}Hash Rate: $HASH_RATE MH/s${NC}"
+        echo -e "${YELLOW}Active Workers: $WORKERS_COUNT${NC}"
+        echo -e "${CYAN}---------------------------------------------------------${NC}"
+        
+        # Display workers information
+        if [[ ! -z "$WORKER_DATA" ]] && [[ "$WORKER_DATA" != *"error"* ]]; then
+            echo -e "${GREEN}WORKERS INFORMATION:${NC}"
+            echo "$WORKER_DATA" | grep -o '"id":"[^"]*"' | while read -r worker; do
+                WORKER_NAME=$(echo "$worker" | cut -d'"' -f4)
+                echo -e "  - $WORKER_NAME"
+            done
+        fi
+        
+        echo -e "${CYAN}---------------------------------------------------------${NC}"
+        echo -e "${YELLOW}Last Update: $(date)${NC}"
+        echo -e "${YELLOW}Next update in 60 seconds...${NC}"
+    else
+        echo -e "${RED}Failed to fetch mining data${NC}"
+    fi
+    
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "Press 'q' to quit dashboard, 'm' for main menu"
+}
+
+start_dashboard() {
+    echo -e "${YELLOW}Starting real-time dashboard...${NC}"
+    echo -e "${YELLOW}Updates every 60 seconds${NC}"
+    
+    while true; do
+        display_dashboard
+        
+        # Wait for input with timeout
+        read -t 60 -n 1 input
+        
+        if [[ $input == "q" ]]; then
+            echo -e "\n${YELLOW}Exiting dashboard...${NC}"
+            break
+        elif [[ $input == "m" ]]; then
+            echo -e "\n${YELLOW}Returning to main menu...${NC}"
+            break
+        fi
+    done
+}
+
+# ============================ AUTO WITHDRAWAL ============================
+setup_auto_withdrawal() {
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}               AUTO WITHDRAWAL SETUP                     ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    if [[ ! -f "$WALLET_FILE" ]]; then
+        echo -e "${RED}No wallet address configured!${NC}"
+        echo -e "${YELLOW}Please setup wallet address first${NC}"
+        return 1
+    fi
+    
+    CURRENT_WALLET=$(cat "$WALLET_FILE")
+    COIN=$(cat "$CONFIG_DIR/coin.txt")
+    
+    echo -e "${GREEN}Current Wallet: $CURRENT_WALLET${NC}"
+    echo -e "${GREEN}Current Coin: $COIN${NC}"
+    
+    if [[ -f "$AUTO_WITHDRAWAL_FILE" ]]; then
+        source "$AUTO_WITHDRAWAL_FILE"
+        echo -e "${YELLOW}Current auto-withdrawal settings:${NC}"
+        echo -e "Minimum Balance: $MIN_BALANCE $COIN"
+        echo -e "Withdrawal Address: $WITHDRAWAL_ADDRESS"
+        echo -e "Enabled: $AUTO_WITHDRAWAL_ENABLED"
+        
+        read -p "Do you want to change settings? (y/n): " CHANGE_SETTINGS
+        if [[ "$CHANGE_SETTINGS" != "y" ]]; then
+            return
+        fi
+    fi
+    
+    echo -e "\n${YELLOW}Auto Withdrawal Configuration:${NC}"
+    read -p "Minimum balance to trigger withdrawal: " MIN_BALANCE
+    read -p "Withdrawal address: " WITHDRAWAL_ADDRESS
+    read -p "Enable auto-withdrawal? (y/n): " ENABLE_AUTO
+    
+    AUTO_WITHDRAWAL_ENABLED="false"
+    if [[ "$ENABLE_AUTO" == "y" ]]; then
+        AUTO_WITHDRAWAL_ENABLED="true"
+    fi
+    
+    # Save settings
+    cat > "$AUTO_WITHDRAWAL_FILE" << EOF
+MIN_BALANCE=$MIN_BALANCE
+WITHDRAWAL_ADDRESS=$WITHDRAWAL_ADDRESS
+AUTO_WITHDRAWAL_ENABLED=$AUTO_WITHDRAWAL_ENABLED
+COIN=$COIN
+EOF
+    
+    echo -e "${GREEN}Auto-withdrawal settings saved!${NC}"
+    
+    if [[ "$AUTO_WITHDRAWAL_ENABLED" == "true" ]]; then
+        echo -e "${YELLOW}Auto-withdrawal is ENABLED${NC}"
+        echo -e "${YELLOW}Will withdraw when balance reaches $MIN_BALANCE $COIN${NC}"
+    else
+        echo -e "${YELLOW}Auto-withdrawal is DISABLED${NC}"
+    fi
+}
+
+check_auto_withdrawal() {
+    if [[ ! -f "$AUTO_WITHDRAWAL_FILE" ]]; then
+        return
+    fi
+    
+    source "$AUTO_WITHDRAWAL_FILE"
+    
+    if [[ "$AUTO_WITHDRAWAL_ENABLED" != "true" ]]; then
+        return
+    fi
+    
+    fetch_mining_data
+    
+    if (( $(echo "$BALANCE >= $MIN_BALANCE" | bc -l) )); then
+        echo -e "${GREEN}Auto-withdrawal condition met!${NC}"
+        echo -e "${GREEN}Balance: $BALANCE $COIN >= Minimum: $MIN_BALANCE $COIN${NC}"
+        echo -e "${YELLOW}Initiating withdrawal to: $WITHDRAWAL_ADDRESS${NC}"
+        
+        # Simulasi withdrawal (dalam implementasi real, ini akan memanggil API withdrawal)
+        echo -e "${CYAN}[SIMULATION] Withdrawing $BALANCE $COIN to $WITHDRAWAL_ADDRESS${NC}"
+        # Implementasi actual withdrawal akan membutuhkan API key dan autentikasi
+    fi
+}
+
+# ============================ MINING FUNCTIONS ============================
+create_config() {
+    if [[ ! -f "$WALLET_FILE" ]]; then
+        echo -e "${RED}No wallet address configured!${NC}"
+        input_wallet_address
+        if [[ $? -ne 0 ]]; then
+            return 1
+        fi
+    fi
+    
+    WALLET=$(cat "$WALLET_FILE")
+    COIN=$(cat "$CONFIG_DIR/coin.txt" 2>/dev/null || echo "XMR")
+    POOL=$(cat "$CONFIG_DIR/pool.txt" 2>/dev/null || echo "xmr.nanopool.org")
+    
+    # Default values untuk port dan algo berdasarkan coin
+    case $COIN in
+        "RVN")
+            DEFAULT_PORT="10400"
+            DEFAULT_ALGO="kawpow"
+            ;;
+        "ZEPH")
+            DEFAULT_PORT="10900"
+            DEFAULT_ALGO="randomx"
+            ;;
+        "XMR")
+            DEFAULT_PORT="10300"
+            DEFAULT_ALGO="randomx"
+            ;;
+        "ETC")
+            DEFAULT_PORT="10100"
+            DEFAULT_ALGO="etchash"
+            ;;
+        "CFX")
+            DEFAULT_PORT="10500"
+            DEFAULT_ALGO="octopus"
+            ;;
+        "ERG")
+            DEFAULT_PORT="10600"
+            DEFAULT_ALGO="autolykos2"
+            ;;
+        "BTC")
+            DEFAULT_PORT="3333"
+            DEFAULT_ALGO="sha256"
+            ;;
+        "ETH")
+            DEFAULT_PORT="9999"
+            DEFAULT_ALGO="ethash"
+            ;;
+        *)
+            DEFAULT_PORT="3333"
+            DEFAULT_ALGO="randomx"
+            ;;
+    esac
+    
+    PORT=$(cat "$CONFIG_DIR/port.txt" 2>/dev/null || echo "$DEFAULT_PORT")
+    ALGO=$(cat "$CONFIG_DIR/algo.txt" 2>/dev/null || echo "$DEFAULT_ALGO")
+    
+    echo -e "${YELLOW}Creating XMRig configuration for $COIN...${NC}"
+    
+    # Konfigurasi pool berdasarkan coin
+    POOL_URL="$POOL:$PORT"
+    
+    cat > "$CONFIG_FILE" << EOF
+{
+    "api": {
+        "id": null,
+        "worker-id": null
+    },
+    "http": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "port": 0,
+        "access-token": null,
+        "restricted": true
+    },
+    "autosave": true,
+    "background": false,
+    "colors": true,
+    "title": true,
+    "randomx": {
+        "init": -1,
+        "mode": "auto",
+        "1gb-pages": false,
+        "rdmsr": true,
+        "wrmsr": true,
+        "cache_qos": false,
+        "numa": true,
+        "scratchpad_prefetch_mode": 1
+    },
+    "cpu": {
+        "enabled": true,
+        "huge-pages": true,
+        "huge-pages-jit": false,
+        "hw-aes": null,
+        "priority": null,
+        "memory-pool": false,
+        "yield": true,
+        "max-threads-hint": 100,
+        "asm": true,
+        "argon2-impl": null,
+        "cn/0": false,
+        "cn-lite/0": false
+    },
+    "opencl": {
+        "enabled": true,
+        "cache": true,
+        "loader": null,
+        "platform": "AMD",
+        "adl": true,
+        "cn/0": false,
+        "cn-lite/0": false
+    },
+    "cuda": {
+        "enabled": true,
+        "loader": null,
+        "nvml": true,
+        "cn/0": false,
+        "cn-lite/0": false
+    },
+    "pools": [
+        {
+            "algo": "$ALGO",
+            "coin": "$COIN",
+            "url": "$POOL_URL",
+            "user": "$WALLET",
+            "pass": "x",
+            "rig-id": "rig-$(hostname)",
+            "nicehash": false,
+            "keepalive": false,
+            "enabled": true,
+            "tls": false,
+            "tls-fingerprint": null,
+            "daemon": false,
+            "socks5": null,
+            "self-select": null,
+            "submit-to-origin": false
+        }
+    ],
+    "print-time": 60,
+    "health-print-time": 60,
+    "dmi": true,
+    "retries": 5,
+    "retry-pause": 5,
+    "syslog": false,
+    "tls": {
+        "enabled": false,
+        "protocols": null,
+        "cert": null,
+        "cert_key": null,
+        "ciphers": null,
+        "ciphersuites": null,
+        "dhparam": null
+    },
+    "user-agent": null,
+    "verbose": 0,
+    "watch": true,
+    "pause-on-battery": false,
+    "pause-on-active": false
+}
+EOF
+    
+    echo -e "${GREEN}Configuration created: $CONFIG_FILE${NC}"
+    echo -e "${GREEN}Coin: $COIN${NC}"
+    echo -e "${GREEN}Pool: $POOL_URL${NC}"
+    echo -e "${GREEN}Algorithm: $ALGO${NC}"
+    
+    # Simpan port dan algo untuk penggunaan berikutnya
+    echo "$PORT" > "$CONFIG_DIR/port.txt"
+    echo "$ALGO" > "$CONFIG_DIR/algo.txt"
+}
+
+start_mining() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}Configuration not found, creating...${NC}"
+        create_config
+    fi
+    
+    if [[ ! -f "$INSTALL_DIR/build/xmrig" ]] && [[ ! -f "$INSTALL_DIR/build/xmrig.exe" ]]; then
+        echo -e "${RED}XMRig binary not found!${NC}"
+        echo -e "${YELLOW}Please build XMRig first using option 3${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Starting mining...${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop mining${NC}"
+    
+    if [[ "$OS" == "windows" ]]; then
+        "$INSTALL_DIR/build/xmrig.exe" --config="$CONFIG_FILE"
+    else
+        "$INSTALL_DIR/build/xmrig" --config="$CONFIG_FILE"
+    fi
+}
+
+# ============================ MAIN MENU ============================
+show_menu() {
+    clear
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}           XMRIG NANOPOOL MINER - MULTI COIN            ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${GREEN}1. Detect Hardware${NC}"
+    echo -e "${GREEN}2. Input Wallet Address${NC}"
+    echo -e "${GREEN}3. Install Dependencies & Build XMRig${NC}"
+    echo -e "${GREEN}4. Create Mining Configuration${NC}"
+    echo -e "${GREEN}5. Start Mining${NC}"
+    echo -e "${GREEN}6. Real-time Dashboard${NC}"
+    echo -e "${GREEN}7. Auto Withdrawal Setup${NC}"
+    echo -e "${GREEN}8. Check Auto Withdrawal${NC}"
+    echo -e "${GREEN}9. View Logs${NC}"
+    echo -e "${GREEN}0. Exit${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    if [[ -f "$WALLET_FILE" ]]; then
+        CURRENT_WALLET=$(cat "$WALLET_FILE")
+        CURRENT_COIN=$(cat "$CONFIG_DIR/coin.txt" 2>/dev/null || echo "Not set")
+        echo -e "${YELLOW}Current Wallet: ${CURRENT_WALLET:0:12}...${CURRENT_WALLET: -8}${NC}"
+        echo -e "${YELLOW}Current Coin: $CURRENT_COIN${NC}"
+    else
+        echo -e "${RED}No wallet configured! Please set wallet first.${NC}"
+    fi
+    echo -e "${CYAN}=========================================================${NC}"
+}
+
+main() {
+    echo -e "${CYAN}Initializing XMRig Nanopool Miner...${NC}"
+    
+    while true; do
+        show_menu
+        read -p "Select option (0-9): " choice
+        
+        case $choice in
+            1) detect_hardware ;;
+            2) input_wallet_address ;;
+            3) install_all_dependencies && build_xmrig_with_gpu_support ;;
+            4) create_config ;;
+            5) start_mining ;;
+            6) start_dashboard ;;
+            7) setup_auto_withdrawal ;;
+            8) check_auto_withdrawal ;;
+            9) 
+                echo -e "${YELLOW}Viewing logs...${NC}"
+                ls -la "$LOG_DIR/"
+                ;;
+            0)
+                echo -e "${GREEN}Thank you for using XMRig Nanopool Miner!${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option!${NC}"
+                ;;
+        esac
+        
+        echo -e "\n${YELLOW}Press Enter to continue...${NC}"
+        read
+    done
+}
+
+# ============================ FUNGSI YANG SUDAH ADA ============================
+# (Tambahkan semua fungsi yang sudah Anda miliki di sini: install_nvidia_dependencies, 
+# install_amd_dependencies, install_intel_dependencies, install_mining_dependencies,
+# install_all_dependencies, build_xmrig_with_gpu_support)
+
+# Install dependencies NVIDIA
+install_nvidia_dependencies() {
+    echo -e "${YELLOW}[INFO] Installing NVIDIA dependencies...${NC}"
+    
+    if [[ "$OS" == "linux" ]]; then
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y nvidia-driver-510 nvidia-cuda-toolkit nvidia-opencl-dev
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y nvidia-driver cuda-toolkit
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y nvidia-driver cuda-toolkit
+        else
+            echo -e "${RED}[ERROR] Unsupported package manager for NVIDIA drivers${NC}"
+        fi
+    elif [[ "$OS" == "windows" ]]; then
+        echo -e "${YELLOW}[INFO] Please ensure NVIDIA drivers are installed from:${NC}"
+        echo -e "${YELLOW}[INFO] https://www.nvidia.com/Download/index.aspx${NC}"
+    fi
+    
+    echo -e "${GREEN}[SUCCESS] NVIDIA dependencies installed!${NC}"
+}
+
+# Install dependencies AMD
+install_amd_dependencies() {
+    echo -e "${YELLOW}[INFO] Installing AMD dependencies...${NC}"
+    
+    if [[ "$OS" == "linux" ]]; then
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y rocm-opencl-dev rocm-dev
+            sudo usermod -a -G video $USER
+            sudo usermod -a -G render $USER
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y rocm-opencl-dev rocm-dev
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y rocm-opencl-dev rocm-dev
+        else
+            echo -e "${RED}[ERROR] Unsupported package manager for AMD drivers${NC}"
+        fi
+    elif [[ "$OS" == "windows" ]]; then
+        echo -e "${YELLOW}[INFO] Please ensure AMD drivers are installed from:${NC}"
+        echo -e "${YELLOW}[INFO] https://www.amd.com/en/support${NC}"
+    fi
+    
+    echo -e "${GREEN}[SUCCESS] AMD dependencies installed!${NC}"
+}
+
+# Install dependencies Intel
+install_intel_dependencies() {
+    echo -e "${YELLOW}[INFO] Installing Intel dependencies...${NC}"
+    
+    if [[ "$OS" == "linux" ]]; then
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y intel-opencl-icd intel-level-zero-gpu level-zero
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y intel-opencl intel-level-zero-gpu level-zero
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y intel-opencl intel-level-zero-gpu level-zero
+        else
+            echo -e "${RED}[ERROR] Unsupported package manager for Intel drivers${NC}"
+        fi
+    elif [[ "$OS" == "windows" ]]; then
+        echo -e "${YELLOW}[INFO] Please ensure Intel GPU drivers are installed from:${NC}"
+        echo -e "${YELLOW}[INFO] https://www.intel.com/content/www/us/en/download-center/home.html${NC}"
+    fi
+    
+    echo -e "${GREEN}[SUCCESS] Intel dependencies installed!${NC}"
+}
+
+# Install dependencies mining umum
+install_mining_dependencies() {
+    echo -e "${YELLOW}[INFO] Installing general mining dependencies...${NC}"
+    
+    if [[ "$OS" == "linux" ]]; then
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y git build-essential cmake libuv1-dev libssl-dev libhwloc-dev wget curl jq bc ocl-icd-opencl-dev opencl-headers
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y git make cmake gcc libuv-devel openssl-devel hwloc-devel wget curl jq bc ocl-icd-devel opencl-headers
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y git make cmake gcc libuv-devel openssl-devel hwloc-devel wget curl jq bc ocl-icd-devel opencl-headers
+        else
+            echo -e "${RED}[ERROR] Unsupported package manager. Please install dependencies manually.${NC}"
+            return 1
+        fi
+    elif [[ "$OS" == "mac" ]]; then
+        if command -v brew &> /dev/null; then
+            brew update
+            brew install git cmake libuv libssl hwloc wget curl jq bc
+        else
+            echo -e "${RED}[ERROR] Homebrew not found. Please install Homebrew first.${NC}"
+            return 1
+        fi
+    elif [[ "$OS" == "windows" ]]; then
+        echo -e "${YELLOW}[INFO] Please install Git for Windows from: https://git-scm.com/download/win${NC}"
+        echo -e "${YELLOW}[INFO] Please install CMake from: https://cmake.org/download/${NC}"
+    fi
+    
+    echo -e "${GREEN}[SUCCESS] General mining dependencies installed!${NC}"
+    return 0
+}
+
+# Install semua dependencies
+install_all_dependencies() {
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}               INSTALLING DEPENDENCIES                   ${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    
+    install_mining_dependencies
+    
+    if detect_nvidia_gpu; then
+        install_nvidia_dependencies
+    fi
+    
+    if detect_amd_gpu; then
+        install_amd_dependencies
+    fi
+    
+    if detect_intel_gpu; then
+        install_intel_dependencies
+    fi
+    
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${GREEN}[SUCCESS] All dependencies installed successfully!${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+}
+
+# Build XMRig dengan dukungan GPU
+build_xmrig_with_gpu_support() {
+    echo -e "${YELLOW}[INFO] Building XMRig with GPU support...${NC}"
+    
+    cd "$INSTALL_DIR"
+    
+    if [ -d "$INSTALL_DIR" ]; then
+        echo -e "${YELLOW}[INFO] Directory exists, checking if it's a valid git repo...${NC}"
+        cd "$INSTALL_DIR"
+        
+        if git rev-parse --git-dir > /dev/null 2>&1; then
+            echo -e "${YELLOW}[INFO] Valid git repository, updating...${NC}"
+            git pull
+        else
+            echo -e "${YELLOW}[INFO] Not a valid git repo, removing and cloning fresh...${NC}"
+            cd ..
+            rm -rf "$INSTALL_DIR"
+            git clone https://github.com/xmrig/xmrig "$INSTALL_DIR"
+            cd "$INSTALL_DIR"
+        fi
+    else
+        git clone https://github.com/xmrig/xmrig "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
+    
+    if [ ! -f "CMakeLists.txt" ]; then
+        echo -e "${RED}[ERROR] CMakeLists.txt not found!${NC}"
+        echo -e "${YELLOW}[INFO] Removing directory and trying fresh clone...${NC}"
+        cd ..
+        rm -rf "$INSTALL_DIR"
+        git clone https://github.com/xmrig/xmrig "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+    fi
+    
+    mkdir -p build
+    cd build
+    
+    if [ -f "Makefile" ]; then
+        make clean
+    fi
+    
+    local cmake_options="-DCMAKE_BUILD_TYPE=Release"
+    
+    if detect_nvidia_gpu; then
+        cmake_options="$cmake_options -DWITH_CUDA=ON -DWITH_NVML=ON"
+    else
+        cmake_options="$cmake_options -DWITH_CUDA=OFF -DWITH_NVML=OFF"
+    fi
+    
+    if detect_amd_gpu || detect_intel_gpu; then
+        cmake_options="$cmake_options -DWITH_OPENCL=ON"
+    else
+        cmake_options="$cmake_options -DWITH_OPENCL=OFF"
+    fi
+    
+    echo -e "${YELLOW}[INFO] Configuring with options: $cmake_options${NC}"
+    cmake .. $cmake_options
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}[ERROR] CMake failed!${NC}"
+        echo -e "${YELLOW}[INFO] Removing build directory and trying again...${NC}"
+        cd ..
+        rm -rf build
+        mkdir build
+        cd build
+        cmake .. $cmake_options
+    fi
+    
+    make -j$(nproc)
+    
+    if [ ! -f xmrig ] && [ ! -f xmrig.exe ]; then
+        echo -e "${RED}[ERROR] XMRig build failed!${NC}"
+        echo -e "${YELLOW}[INFO] Trying to download pre-built binary...${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}[SUCCESS] XMRig built successfully with GPU support!${NC}"
+    return 0
+}
+
+# ============================ EXECUTE MAIN ============================
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi
